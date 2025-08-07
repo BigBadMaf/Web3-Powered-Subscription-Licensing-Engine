@@ -6,6 +6,9 @@
 (define-constant ERR_FEATURE_NOT_FOUND (err u104))
 (define-constant ERR_ALREADY_SUBSCRIBED (err u105))
 (define-constant ERR_INVALID_TIER (err u106))
+(define-constant ERR_CANNOT_TRANSFER_TO_SELF (err u107))
+(define-constant ERR_RECIPIENT_HAS_SUBSCRIPTION (err u108))
+(define-constant ERR_TRANSFER_NOT_ALLOWED (err u109))
 
 (define-data-var next-subscription-id uint u1)
 (define-data-var platform-fee-percentage uint u5)
@@ -59,6 +62,19 @@
   { balance: uint }
 )
 
+(define-map subscription-transfers
+  { transfer-id: uint }
+  {
+    subscription-id: uint,
+    from-user: principal,
+    to-user: principal,
+    transfer-block: uint,
+    is-gift: bool
+  }
+)
+
+(define-data-var next-transfer-id uint u1)
+
 (define-private (is-contract-owner)
   (is-eq tx-sender CONTRACT_OWNER)
 )
@@ -107,6 +123,30 @@
 (define-read-only (get-creator-balance (creator principal))
   (default-to { balance: u0 }
     (map-get? creator-balances { creator: creator }))
+)
+
+(define-read-only (get-subscription-transfer (transfer-id uint))
+  (map-get? subscription-transfers { transfer-id: transfer-id })
+)
+
+(define-read-only (can-transfer-subscription (user principal))
+  (match (get-user-subscription user)
+    user-sub
+      (let (
+        (sub-id (get active-subscription-id user-sub))
+      )
+      (match (get-subscription sub-id)
+        subscription
+          (let (
+            (start-block (get start-block subscription))
+            (duration (get duration-blocks subscription))
+            (blocks-remaining (- (+ start-block duration) burn-block-height))
+          )
+          (and 
+            (get is-active subscription)
+            (> blocks-remaining u144)))
+        false))
+    false)
 )
 
 (define-public (create-subscription-tier 
@@ -285,6 +325,103 @@
     (asserts! (<= new-fee u20) ERR_INVALID_TIER)
     (var-set platform-fee-percentage new-fee)
     (ok new-fee))
+)
+
+(define-public (transfer-subscription (recipient principal))
+  (let (
+    (transfer-id (var-get next-transfer-id))
+  )
+  (match (get-user-subscription tx-sender)
+    sender-sub
+      (let (
+        (sub-id (get active-subscription-id sender-sub))
+      )
+      (match (get-subscription sub-id)
+        subscription
+          (let (
+            (recipient-existing-sub (get-user-subscription recipient))
+          )
+          (begin
+            (asserts! (not (is-eq tx-sender recipient)) ERR_CANNOT_TRANSFER_TO_SELF)
+            (asserts! (is-none recipient-existing-sub) ERR_RECIPIENT_HAS_SUBSCRIPTION)
+            (asserts! (can-transfer-subscription tx-sender) ERR_TRANSFER_NOT_ALLOWED)
+            (asserts! (is-subscription-active sub-id) ERR_SUBSCRIPTION_EXPIRED)
+            
+            (map-set subscriptions
+              { subscription-id: sub-id }
+              (merge subscription { user: recipient }))
+            
+            (map-delete user-subscriptions { user: tx-sender })
+            (map-set user-subscriptions
+              { user: recipient }
+              { active-subscription-id: sub-id })
+            
+            (map-set subscription-transfers
+              { transfer-id: transfer-id }
+              {
+                subscription-id: sub-id,
+                from-user: tx-sender,
+                to-user: recipient,
+                transfer-block: burn-block-height,
+                is-gift: false
+              })
+            
+            (var-set next-transfer-id (+ transfer-id u1))
+            (ok transfer-id)))
+        ERR_INVALID_SUBSCRIPTION))
+    ERR_INVALID_SUBSCRIPTION))
+)
+
+(define-public (gift-subscription (recipient principal) (tier-id uint) (duration-blocks uint))
+  (let (
+    (subscription-id (var-get next-subscription-id))
+    (transfer-id (var-get next-transfer-id))
+    (recipient-existing-sub (get-user-subscription recipient))
+  )
+  (match (get-subscription-tier tier-id)
+    tier-info
+      (let (
+        (total-cost (* (get price-per-block tier-info) duration-blocks))
+        (platform-fee (calculate-platform-fee total-cost))
+        (creator-share (calculate-creator-share total-cost (get creator-revenue-share tier-info)))
+      )
+      (begin
+        (asserts! (not (is-eq tx-sender recipient)) ERR_CANNOT_TRANSFER_TO_SELF)
+        (asserts! (is-none recipient-existing-sub) ERR_RECIPIENT_HAS_SUBSCRIPTION)
+        (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+        
+        (map-set subscriptions
+          { subscription-id: subscription-id }
+          {
+            user: recipient,
+            tier: tier-id,
+            start-block: burn-block-height,
+            duration-blocks: duration-blocks,
+            is-active: true,
+            amount-paid: total-cost,
+            creator: CONTRACT_OWNER
+          })
+        
+        (map-set user-subscriptions
+          { user: recipient }
+          { active-subscription-id: subscription-id })
+        
+        (map-set subscription-transfers
+          { transfer-id: transfer-id }
+          {
+            subscription-id: subscription-id,
+            from-user: tx-sender,
+            to-user: recipient,
+            transfer-block: burn-block-height,
+            is-gift: true
+          })
+        
+        (var-set next-subscription-id (+ subscription-id u1))
+        (var-set next-transfer-id (+ transfer-id u1))
+        (var-set total-revenue (+ (var-get total-revenue) total-cost))
+        
+        (ok subscription-id)))
+    ERR_INVALID_TIER))
 )
 
 (create-subscription-tier u1 "Basic" u10 u5 u70)
