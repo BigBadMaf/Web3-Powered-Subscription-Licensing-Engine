@@ -74,6 +74,10 @@
 )
 
 (define-data-var next-transfer-id uint u1)
+(define-map paused-subscriptions
+  { subscription-id: uint }
+  { paused-at: uint, is-paused: bool }
+)
 
 (define-private (is-contract-owner)
   (is-eq tx-sender CONTRACT_OWNER)
@@ -419,9 +423,63 @@
         (var-set next-subscription-id (+ subscription-id u1))
         (var-set next-transfer-id (+ transfer-id u1))
         (var-set total-revenue (+ (var-get total-revenue) total-cost))
-        
+
         (ok subscription-id)))
     ERR_INVALID_TIER))
+)
+
+(define-public (pause-subscription)
+  (match (get-user-subscription tx-sender)
+    user-sub
+      (let (
+        (sub-id (get active-subscription-id user-sub))
+      )
+      (match (get-subscription sub-id)
+        subscription
+          (let (
+            (is-paused (default-to false (get is-paused (map-get? paused-subscriptions { subscription-id: sub-id }))))
+          )
+          (begin
+            (asserts! (is-subscription-active sub-id) ERR_SUBSCRIPTION_EXPIRED)
+            (asserts! (not is-paused) ERR_INVALID_SUBSCRIPTION)
+            (map-set paused-subscriptions
+              { subscription-id: sub-id }
+              { paused-at: burn-block-height, is-paused: true })
+            (ok sub-id)))
+        ERR_INVALID_SUBSCRIPTION))
+    ERR_INVALID_SUBSCRIPTION)
+)
+
+(define-public (resume-subscription)
+  (match (get-user-subscription tx-sender)
+    user-sub
+      (let (
+        (sub-id (get active-subscription-id user-sub))
+      )
+      (match (get-subscription sub-id)
+        subscription
+          (let (
+            (paused-info (map-get? paused-subscriptions { subscription-id: sub-id }))
+          )
+          (match paused-info
+            p-info
+              (let (
+                (paused-at (get paused-at p-info))
+                (is-paused (get is-paused p-info))
+                (paused-duration (- burn-block-height paused-at))
+              )
+              (begin
+                (asserts! is-paused ERR_INVALID_SUBSCRIPTION)
+                (map-set subscriptions
+                  { subscription-id: sub-id }
+                  (merge subscription { duration-blocks: (+ (get duration-blocks subscription) paused-duration) }))
+                (map-set paused-subscriptions
+                  { subscription-id: sub-id }
+                  { paused-at: u0, is-paused: false })
+                (ok sub-id)))
+            ERR_INVALID_SUBSCRIPTION))
+        ERR_INVALID_SUBSCRIPTION))
+    ERR_INVALID_SUBSCRIPTION)
 )
 
 (create-subscription-tier u1 "Basic" u10 u5 u70)
