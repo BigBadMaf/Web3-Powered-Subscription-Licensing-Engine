@@ -9,8 +9,11 @@
 (define-constant ERR_CANNOT_TRANSFER_TO_SELF (err u107))
 (define-constant ERR_RECIPIENT_HAS_SUBSCRIPTION (err u108))
 (define-constant ERR_TRANSFER_NOT_ALLOWED (err u109))
+(define-constant ERR_REFERRAL_CODE_EXISTS (err u110))
+(define-constant ERR_INVALID_REFERRAL_CODE (err u111))
 
 (define-data-var next-subscription-id uint u1)
+(define-data-var referral-reward-percentage uint u10)
 (define-data-var platform-fee-percentage uint u5)
 (define-data-var total-revenue uint u0)
 
@@ -71,6 +74,16 @@
     transfer-block: uint,
     is-gift: bool
   }
+)
+
+(define-map referral-codes
+  { code: (string-ascii 20) }
+  { referrer: principal, is-active: bool }
+)
+
+(define-map user-referrals
+  { user: principal }
+  { referral-count: uint, total-rewards: uint }
 )
 
 (define-data-var next-transfer-id uint u1)
@@ -146,11 +159,20 @@
             (duration (get duration-blocks subscription))
             (blocks-remaining (- (+ start-block duration) burn-block-height))
           )
-          (and 
+          (and
             (get is-active subscription)
             (> blocks-remaining u144)))
         false))
     false)
+)
+
+(define-read-only (get-referral-code (code (string-ascii 20)))
+  (map-get? referral-codes { code: code })
+)
+
+(define-read-only (get-user-referrals (user principal))
+  (default-to { referral-count: u0, total-rewards: u0 }
+    (map-get? user-referrals { user: user }))
 )
 
 (define-public (create-subscription-tier 
@@ -173,9 +195,9 @@
     (ok tier-id))
 )
 
-(define-public (create-feature 
-  (feature-id uint) 
-  (name (string-ascii 100)) 
+(define-public (create-feature
+  (feature-id uint)
+  (name (string-ascii 100))
   (required-tier uint))
   (begin
     (map-set features
@@ -187,6 +209,79 @@
         is-active: true
       })
     (ok feature-id))
+)
+
+(define-public (generate-referral-code (code (string-ascii 20)))
+  (let (
+    (existing-code (get-referral-code code))
+  )
+  (begin
+    (asserts! (is-none existing-code) ERR_REFERRAL_CODE_EXISTS)
+    (map-set referral-codes
+      { code: code }
+      { referrer: tx-sender, is-active: true })
+    (ok code)))
+)
+
+(define-public (subscribe-with-referral (tier-id uint) (duration-blocks uint) (referral-code (string-ascii 20)))
+  (let (
+    (subscription-id (var-get next-subscription-id))
+    (existing-sub (get-user-subscription tx-sender))
+    (referral-info (get-referral-code referral-code))
+  )
+  (match (get-subscription-tier tier-id)
+    tier-info
+      (let (
+        (total-cost (* (get price-per-block tier-info) duration-blocks))
+        (platform-fee (calculate-platform-fee total-cost))
+        (creator-share (calculate-creator-share total-cost (get creator-revenue-share tier-info)))
+        (referral-reward (if (is-some referral-info)
+          (/ (* total-cost (var-get referral-reward-percentage)) u100)
+          u0))
+      )
+      (begin
+        (asserts! (is-none existing-sub) ERR_ALREADY_SUBSCRIBED)
+        (if (is-some referral-info)
+          (asserts! (get is-active (unwrap-panic referral-info)) ERR_INVALID_REFERRAL_CODE)
+          true)
+        (try! (stx-transfer? total-cost tx-sender (as-contract tx-sender)))
+
+        (map-set subscriptions
+          { subscription-id: subscription-id }
+          {
+            user: tx-sender,
+            tier: tier-id,
+            start-block: burn-block-height,
+            duration-blocks: duration-blocks,
+            is-active: true,
+            amount-paid: total-cost,
+            creator: CONTRACT_OWNER
+          })
+
+        (map-set user-subscriptions
+          { user: tx-sender }
+          { active-subscription-id: subscription-id })
+
+        (if (> referral-reward u0)
+          (let (
+            (referrer (get referrer (unwrap-panic referral-info)))
+            (current-referrals (get-user-referrals referrer))
+          )
+          (begin
+            (try! (as-contract (stx-transfer? referral-reward tx-sender referrer)))
+            (map-set user-referrals
+              { user: referrer }
+              {
+                referral-count: (+ (get referral-count current-referrals) u1),
+                total-rewards: (+ (get total-rewards current-referrals) referral-reward)
+              })))
+          true)
+
+        (var-set next-subscription-id (+ subscription-id u1))
+        (var-set total-revenue (+ (var-get total-revenue) total-cost))
+
+        (ok subscription-id)))
+    ERR_INVALID_TIER))
 )
 
 (define-public (subscribe (tier-id uint) (duration-blocks uint))
