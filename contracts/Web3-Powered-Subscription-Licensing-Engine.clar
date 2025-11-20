@@ -577,6 +577,55 @@
     ERR_INVALID_SUBSCRIPTION)
 )
 
+(define-public (change-subscription-tier (new-tier-id uint))
+  (match (get-user-subscription tx-sender)
+    user-sub
+      (let (
+        (sub-id (get active-subscription-id user-sub))
+      )
+      (match (get-subscription sub-id)
+        subscription
+          (let (
+            (current-tier-id (get tier subscription))
+            (start-block (get start-block subscription))
+            (total-duration (get duration-blocks subscription))
+            (current-amount-paid (get amount-paid subscription))
+            (blocks-elapsed (- burn-block-height start-block))
+            (blocks-remaining (- total-duration blocks-elapsed))
+          )
+          (match (get-subscription-tier current-tier-id)
+            current-tier
+              (match (get-subscription-tier new-tier-id)
+                new-tier
+                  (let (
+                    (current-price-per-block (get price-per-block current-tier))
+                    (new-price-per-block (get price-per-block new-tier))
+                    (current-cost-remaining (* current-price-per-block blocks-remaining))
+                    (new-cost-remaining (* new-price-per-block blocks-remaining))
+                    (difference (if (> new-cost-remaining current-cost-remaining)
+                      (- new-cost-remaining current-cost-remaining)
+                      (- current-cost-remaining new-cost-remaining)))
+                  )
+                  (begin
+                    (asserts! (is-subscription-active sub-id) ERR_SUBSCRIPTION_EXPIRED)
+                    (asserts! (> blocks-remaining u0) ERR_INVALID_SUBSCRIPTION)
+                    (if (> new-cost-remaining current-cost-remaining)
+                      (try! (stx-transfer? difference tx-sender (as-contract tx-sender)))
+                      (try! (as-contract (stx-transfer? difference tx-sender tx-sender))))
+                    (map-set subscriptions
+                      { subscription-id: sub-id }
+                      (merge subscription {
+                        tier: new-tier-id,
+                        amount-paid: (if (> new-cost-remaining current-cost-remaining)
+                          (+ current-amount-paid difference)
+                          (- current-amount-paid difference))
+                      }))
+                    (ok sub-id)))
+                ERR_INVALID_TIER)
+            ERR_INVALID_TIER))
+        ERR_INVALID_SUBSCRIPTION))
+    ERR_INVALID_SUBSCRIPTION))
+
 (create-subscription-tier u1 "Basic" u10 u5 u70)
 (create-subscription-tier u2 "Pro" u25 u15 u75)
 (create-subscription-tier u3 "Enterprise" u50 u50 u80)
